@@ -3,6 +3,7 @@ import pycuda.compiler as nvcc
 import pycuda.gpuarray as gpuarray
 import pycuda.driver as cu
 import pycuda.autoinit
+from pycuda import cumath
 import numpy as np
 from pycuda.tools import make_default_context
 
@@ -50,7 +51,7 @@ def generate_delay_table(drift_rates, delta_t, ntimes):
 
 class TurboSolver:
 
-	def __init__(self, ntimes=16, nfreqs=128, ndelays=32, delta_t=20., block_size=(16, 32, 1)):
+	def __init__(self, ntimes=16, nfreqs=128, ndelays=32, delta_t=20., connectivity=2, block_size=(16, 32, 1)):
 
 		"""
 		nfreqs: Data will be fed in a chunk at at time, this is number of channels in a chunk
@@ -63,12 +64,14 @@ class TurboSolver:
 		 	'BDX': block_size[0],
 			'BDY': block_size[1],
 			'NTIMES': ntimes,
-			'NDELAYS': ndelays
+			'NDELAYS': ndelays,
+			'CONN': connectivity
 		}
 		main_module = nvcc.SourceModule(kernel_code)
 
 		self.spectr_d = gpuarray.empty([ntimes, nfreqs], dtype=np.float32) # y dimension by x dimension
 		self.output_d = gpuarray.zeros([ndelays, nfreqs], dtype=np.float32)
+		self.mask_d = gpuarray.zeros_like(self.output_d, dtype=bool)
 
 		delay_table_h = generate_delay_table(np.linspace(-0.1, 0.1, ndelays), 
 													delta_t=delta_t, ntimes=ntimes)
@@ -80,6 +83,7 @@ class TurboSolver:
 		else:
 			self.sweep_kernel = main_module.get_function("sweep")
 			self.delay_table_d = gpuarray.to_gpu(delay_table_h)
+		self.threshold_kernel = main_module.get_function("threshold_and_local_max")
 
 		self.nfreqs = np.int32(nfreqs)
 		self.ntimes = np.int32(ntimes)
@@ -90,7 +94,7 @@ class TurboSolver:
 		print self.grid_size
 
 
-	def bench(self, data, plot=True):
+	def bench(self, data, plot=True, get=False):
 
 		""" Function to test drift rate search
 			note this bench mark contains compilation times and multiple kernel calls. 
@@ -109,7 +113,17 @@ class TurboSolver:
 					block=self.block_size, grid=self.grid_size)
 		compute.record(); compute.synchronize()
 
-		out = self.output_d.get()
+		if get:
+			out = self.output_d.get()
+		else:
+			operand = self.output_d[self.ndelays//2]
+			mean = gpuarray.sum(operand/np.float32(self.nfreqs)).get()
+			var = gpuarray.sum((operand-mean)*(operand-mean)/np.float32(self.nfreqs))
+			std = np.sqrt(var.get())
+			self.threshold_kernel(self.output_d, self.mask_d, np.float32(3*std + mean), 
+								self.nfreqs, self.ndelays,
+								block=self.block_size, grid=self.grid_size)
+			out = (self.output_d*self.mask_d).get()
 
 		stop.record(); stop.synchronize()
 
@@ -130,7 +144,7 @@ class TurboSolver:
 			plt.show()
 		return out 
 
-	def run(self, data):
+	def run(self, data, get=False):
 
 		""" Function to perform drift rate conversion"""
 
@@ -138,8 +152,17 @@ class TurboSolver:
 		self.sweep_kernel(self.spectr_d, self.output_d, self.delay_table_d, 
 					self.nfreqs, self.ntimes, self.ndelays, 
 					block=self.block_size, grid=self.grid_size)
-		out = self.output_d.get()
-		return out
+		if get:
+			out = self.output_d.get()
+			return out
+		else:
+			operand = self.output_d[self.ndelays//2]
+			mean = gpuarray.sum(operand/np.float32(self.nfreqs))
+			var = gpuarray.sum((operand-mean)*(operand-mean)/np.float32(self.nfreqs))
+			std = np.sqrt(var.get())
+			self.output_d = self.output_d - mean
+			thresholded = self.output_d > 3*std
+			return thresholded.get()
 
 if __name__ == "__main__":
 
